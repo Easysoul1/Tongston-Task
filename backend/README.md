@@ -32,6 +32,8 @@ npm run dev --workspace=backend         # http://localhost:3000
 | `AWS_ACCESS_KEY_ID` / `AWS_SECRET_ACCESS_KEY` / `AWS_REGION` / `AWS_S3_BUCKET` | — | Enables real S3 promotion; mock settlement is used otherwise |
 | `AI_API_KEY` | — | Real key switches `getProvider()` to `OpenAIProvider`; mock otherwise |
 
+Placeholder values (`your_…`, `optional_…`, `changeme`, …) are detected by `isUsableCredential()` and treated as absent, so a half-configured `.env` degrades to the mock provider instead of failing at request time.
+
 ## Scripts
 
 | Script | What it does |
@@ -61,7 +63,8 @@ src/
 │   ├── storage.service.ts    StorageProvider interface · Cloudinary · S3 · Mock
 │   └── idempotency.service.ts  atomic key claim + stored response replay
 ├── models/                   7 Mongoose schemas, explicit indexes, timestamps
-└── utils/                    errors · response envelope · crypto · asyncHandler · objectIdSchema
+├── schemas/common.schema.ts  shared Zod schemas (bodies, queries, ObjectId params)
+└── utils/                    errors · response envelope · crypto · asyncHandler · credentials
 ```
 
 ## API
@@ -75,7 +78,7 @@ Base path `/api/v1`. Every response uses one envelope:
 | Endpoint | Method | Body / Query | Auth | Rate limit |
 |---|---|---|---|---|
 | `/health` | GET | — | — | general (IP) |
-| `/auth/register` | POST | `{email, password, role?}` | — | general (IP) |
+| `/auth/register` | POST | `{email, password}` | — | general (IP) |
 | `/auth/login` | POST | `{email, password}` | — | general (IP) |
 | `/content` | POST | `{title, body, tags?}` | ✅ | general (IP) |
 | `/content` | GET | `?tag&q&page&limit` | ✅ | general (IP) |
@@ -86,16 +89,16 @@ Base path `/api/v1`. Every response uses one envelope:
 | `/tokens/history` | GET | `?page&limit` | ✅ | general (IP) |
 | `/tokens/convert` | POST | `{toAsset, amount}` | ✅ | **user-id (10/min)** |
 | `/tokens/withdraw` | POST | `{amount, destination}` | ✅ | idempotency-key aware |
-| `/media/upload` | POST | multipart `file` | ✅ | general (IP) |
+| `/media/upload` | POST | multipart `file` (≤10 MB, image/audio/video/PDF) | ✅ | general (IP) |
 | `/media/:id/promote` | POST | — | ✅ | general (IP) |
 
 Auth responses return `{ token, user: { id, email, role, tokenBalance } }`.
 
 ### Error semantics
 
-`400` malformed input · `401` missing/invalid JWT · `403` wrong role · `404` not found · `409` conflict (insufficient balance, idempotency in flight) · `422` Zod validation · `429` rate limited or the 15s AI window is open · `500` server error (internals logged, never returned).
+`400` malformed input · `401` missing/invalid JWT · `403` wrong role · `404` not found · `409` conflict (insufficient balance, idempotency in flight or reused with a different payload) · `413` upload over the size limit · `422` Zod validation · `429` rate limited or the 15s AI window is open · `500` server error (internals logged, never returned).
 
-One central handler maps `ZodError → 422`, `CastError → 400`, and rate-limit errors → `429`. Pino logs every request with a request id and, when authenticated, the user id.
+One central handler maps `ZodError → 422`, malformed ids → `400`, upload errors → `400/413`, and rate-limit errors → `429`; unknown routes → `404`. 5xx messages are never echoed to the client — provider and database internals stay in the log. Pino logs every request with a request id and, when authenticated, the user id.
 
 ## Guarantees worth knowing
 
@@ -110,4 +113,4 @@ One central handler maps `ZodError → 422`, `CastError → 400`, and rate-limit
 npm test --workspace=backend
 ```
 
-Covers: converting more than the balance is rejected, a valid conversion is atomic (balance + ledger + contract), and the ledger stays insert-only.
+Covers the three ledger properties (conversion beyond the balance is rejected, a valid conversion is atomic, the ledger stays insert-only) and the HTTP contract in `src/app.test.ts`: missing/invalid token → `401` without taking the process down, malformed id → `400`, invalid body/query → `422`, unknown route → `404`, health → `200`.

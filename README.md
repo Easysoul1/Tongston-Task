@@ -100,8 +100,9 @@ Tongston-Task/
 │   │   ├── routes/              # /auth /content /ai /tokens /media
 │   │   ├── services/            # ai/ (provider + ai.service), token.service, storage.service, idempotency.service
 │   │   ├── scripts/seed.ts      # admin@test.com / user@test.com (bcrypt-hashed)
-│   │   ├── utils/               # errors, response, crypto, asyncHandler
+│   │   ├── utils/               # errors, response, crypto, asyncHandler, credentials
 │   │   ├── app.ts               # express app wiring
+│   │   ├── app.test.ts          # HTTP contract tests (auth, validation, error mapping)
 │   │   └── server.ts            # entrypoint
 │   └── .env.example
 ├── frontend/                    # React admin UI
@@ -113,6 +114,7 @@ Tongston-Task/
 │   │   ├── store/index.ts       # Zustand auth + balance (localStorage persisted)
 │   │   └── types/               # shared API types
 │   └── vite.config.ts           # /api proxy → :3000
+├── .github/workflows/ci.yml     # install → lint → build → test on every push/PR
 ├── eslint.config.mjs            # shared ESLint 10 flat config
 └── package.json                 # npm workspaces + concurrently
 ```
@@ -179,7 +181,7 @@ Open <http://localhost:5173> and sign in with `admin@test.com` / `admin123`.
 | `npm run dev` | backend (`tsx watch`) + frontend (Vite) concurrently |
 | `npm run build` | type-check + build both workspaces |
 | `npm run lint` | ESLint 10 flat config across both workspaces |
-| `npm test` | Jest suite for the token ledger |
+| `npm test` | Jest suite — token ledger guarantees + HTTP contract |
 | `npm run seed` | seed the two demo users |
 | `npm start` | run the compiled backend (`dist/server.js`) |
 
@@ -203,7 +205,7 @@ Every endpoint returns the same envelope, so clients never have to guess:
 | Endpoint | Method | Body / Query | Auth | Rate limit |
 |---|---|---|---|---|
 | `/api/v1/health` | GET | — | — | general (IP) |
-| `/api/v1/auth/register` | POST | `{email, password, role?}` | — | general (IP) |
+| `/api/v1/auth/register` | POST | `{email, password}` | — | general (IP) |
 | `/api/v1/auth/login` | POST | `{email, password}` | — | general (IP) |
 | `/api/v1/content` | POST | `{title, body, tags?}` | ✅ | general (IP) |
 | `/api/v1/content` | GET | `?tag&q&page&limit` | ✅ | general (IP) |
@@ -214,7 +216,7 @@ Every endpoint returns the same envelope, so clients never have to guess:
 | `/api/v1/tokens/history` | GET | `?page&limit` | ✅ | general (IP) |
 | `/api/v1/tokens/convert` | POST | `{toAsset, amount}` | ✅ | **user-id (10/min)** |
 | `/api/v1/tokens/withdraw` | POST | `{amount, destination}` | ✅ | idempotency-key aware |
-| `/api/v1/media/upload` | POST | multipart `file` | ✅ | general (IP) |
+| `/api/v1/media/upload` | POST | multipart `file` (≤10 MB, image/audio/video/PDF) | ✅ | general (IP) |
 | `/api/v1/media/:id/promote` | POST | — | ✅ | general (IP) |
 
 <details>
@@ -273,17 +275,17 @@ One central error handler maps `ZodError → 422`, malformed ids → `400`, uplo
 
 ## Data models & indexes
 
-All schemas use `timestamps: true` and declare their indexes explicitly.
+All schemas use `timestamps: true` and declare their indexes explicitly. Mongoose derives the collection names from the model names (`AIRun` → `airuns`); the prose below uses the conceptual names `ai_runs`, `token_transactions`, and so on for readability.
 
-| Model | Purpose | Indexes |
-|---|---|---|
-| **users** | Account + token balance | `email` unique; `role`; `tokenBalance` default 0 |
-| **content_items** | User content | `tags`; `createdBy`; text index on `title + body` (search) |
-| **ai_runs** | One row per AI attempt — the audit trail | `contentId + userId + createdAt` (idempotency window); `contentId`; `userId` |
-| **token_transactions** | **Immutable** ledger — inserts only, never updated or deleted | `userId + createdAt` desc |
-| **contract_conversions** | Mock on-chain conversion records | `userId + createdAt` desc; `txHashMock` |
-| **media_assets** | Upload/promotion state | `status`; `cloudinaryPublicId` |
-| **idempotency_keys** | Request fingerprints + stored responses | `key` unique; 7-day TTL |
+| Model | Mongo collection | Purpose | Indexes |
+|---|---|---|---|
+| `User` | `users` | Account + token balance | `email` unique; `role`; `tokenBalance` default 0 |
+| `ContentItem` | `contentitems` | User content | `tags`; `createdBy`; text index on `title` + `body` (search) |
+| `AIRun` | `airuns` | One row per AI attempt — the audit trail | `contentId + userId + createdAt` (idempotency window); `contentId`; `userId` |
+| `TokenTransaction` | `tokentransactions` | **Immutable** ledger — inserts only, never updated or deleted | `userId + createdAt` desc |
+| `ContractConversion` | `contractconversions` | Mock on-chain conversion records | `userId + createdAt` desc; `txHashMock` |
+| `MediaAsset` | `mediaassets` | Upload/promotion state | `createdBy`; `status`; `cloudinaryPublicId` |
+| `IdempotencyKey` | `idempotencykeys` | Request fingerprints + stored responses | `key` unique; 7-day TTL |
 
 **Ledger rules (why the money maths is safe)**
 
@@ -335,16 +337,17 @@ Two concurrent converts both read the same starting balance inside their own sna
 ## Storage flow
 
 ```text
-POST /media/upload      → multer memoryStorage → StorageProvider.upload(buffer)
-                         → CloudinaryStorage (if creds) else MockStorage
-                         → media_assets row (status CLOUDINARY)
+POST /media/upload      → multer memoryStorage (10 MB cap, MIME allow-list)
+                         → StorageProvider.upload(buffer, originalName, mimeType)
+                         → CloudinaryStorage (real creds) else MockStorage
+                         → media_assets row (createdBy, status CLOUDINARY)
 
-POST /media/:id/promote → idempotent: already S3 → return existing record
-                         → S3Storage.upload() when AWS creds exist, else mock://promote
-                         → media_assets row updated to status S3
+POST /media/:id/promote → idempotent: already S3 → return the existing record
+                         → S3Storage.upload() when AWS creds are real, else the mock provider
+                         → media_assets row updated to status S3 (or FAILED if the upload throws)
 ```
 
-Both providers implement the same `StorageProvider` interface (`upload(buffer, originalName) → {url, key}`), so the controller never knows which backend is in play. Uploads are streamed through memory rather than the local filesystem, so the API stays stateless and deployable.
+Both providers implement the same `StorageProvider` interface (`upload(buffer, originalName, mimeType) → {url, key}`), so the controller never knows which backend is in play. Uploads are streamed through memory rather than the local filesystem, so the API stays stateless and deployable. Credentials that are still placeholders (`your_…`, `optional_…`, `changeme`, …) are detected by `isUsableCredential()` and treated as absent, so a half-configured `.env` degrades to the mock provider instead of failing at request time.
 
 ---
 
@@ -394,9 +397,25 @@ If step 3 fails, the run is marked `FAILED` **outside** the transaction so the a
 
 - The client supplies an `Idempotency-Key` header once per intent and reuses it on retries.
 - The key is claimed atomically via a unique constraint — never SELECT-then-INSERT, which races.
-- Same key + different payload → `422` (`IDEMPOTENCY_KEY_REUSED`), failing loudly rather than silently doing the wrong thing.
+- Same key + different payload → `409` (`CONFLICT`), failing loudly rather than silently doing the wrong thing.
 - An in-flight duplicate → deliberate `409`, so the client retries later.
+- Same key + same payload after success → the stored response is replayed with its original status, so a retry never moves the balance twice.
 - Keys carry a 7-day TTL, which must outlive the longest retry path.
+
+---
+
+## Security & hardening
+
+| Concern | How it is handled |
+|---|---|
+| Password storage | `bcryptjs`, cost 10, never returned by any endpoint |
+| Tokens | JWT signed with `JWT_SECRET`, 24h expiry; the secret is required at boot (`requireEnv`) |
+| Privilege escalation | The public register endpoint always creates a `USER`; a client-supplied `role` is ignored — only the seed script and the database can mint an `ADMIN` |
+| File uploads | `multer` limits: 10 MB per file, one file per request, and an allow-list of image/audio/video/PDF MIME types; anything else is a `400` |
+| Error leakage | 5xx responses return a generic `Internal server error`; provider and database messages stay in the Pino log |
+| Transport & headers | `helmet` defaults, explicit CORS origin (`CORS_ORIGIN`, `*` only for local development) |
+| Abuse control | Per-IP general limiter (300 / 15 min), per-user AI limiter (5 / min), per-user conversion limiter (10 / min) |
+| Auditability | Every AI attempt and every balance movement is a persisted row — `ai_runs` and the append-only `token_transactions` ledger |
 
 ---
 
@@ -411,6 +430,12 @@ The Jest suite covers the three properties that matter most for a token system:
 - `rejects conversion exceeding balance` — you cannot spend what you do not have.
 - `completes conversion within balance atomically` — balance, ledger row and contract record move together.
 - `service uses insert-only ledger pattern` — there is no update path for `token_transactions`.
+
+and the HTTP contract, in `backend/src/app.test.ts` (the app is booted on an ephemeral port, no database needed):
+
+- missing token → `401`, invalid token → `401` — and the process stays alive, which is exactly the regression that used to kill the server;
+- malformed `:id` → `400`, invalid body → `422`, invalid query → `422`, unknown route → `404`;
+- `GET /api/v1/health` → `200`.
 
 Quality gates for the whole repo:
 
@@ -453,7 +478,7 @@ npm run build    # tsc + vite build
 - The AI provider is **mock-first**: the assessment runs with zero external credentials; a real key flips `getProvider()` automatically.
 - The Web3 side is **simulated**. `MOCK_USDT` / `MOCK_ETH` are ledger entries with realistic `0x` + 64-hex transaction hashes generated by `crypto.randomBytes`, not on-chain transfers.
 - Transactions require Atlas or a configured single-node replica set — a stock local `mongod` cannot run them.
-- Media promotion falls back to a mock S3 record when AWS credentials are absent.
+- Media promotion falls back to a mock S3 record when AWS credentials are absent or still placeholders.
 
 ---
 
