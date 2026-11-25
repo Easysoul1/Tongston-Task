@@ -1,0 +1,35 @@
+# Dependencies
+node_modules/
+
+# Build output
+dist/
+build/
+*.tsbuildinfo
+
+# Environment / secrets — only .env.example is committed
+.env
+.env.*
+!.env.example
+
+# Test output
+coverage/
+.nyc_output/
+
+# Logs
+*.log
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+pino-pretty.log
+
+# Editor / OS
+.DS_Store
+Thumbs.db
+.vscode/
+.idea/
+*.swp
+
+# Local client assessment materials — kept out of the public repo
+*.pdf
+TONGSTON-ASSESSMENT-MASTER-PLAN.md
+TONGSTON-ASSESSMENT-MASTER-PLAN.txt

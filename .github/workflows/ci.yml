@@ -1,0 +1,40 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+jobs:
+  quality-gates:
+    name: Lint, build & test
+    runs-on: ubuntu-latest
+
+    env:
+      # The test suite mocks the database; these keep module-level env reads happy.
+      MONGO_URI: mongodb://127.0.0.1:27017/tongston-ci
+      JWT_SECRET: ci-secret-not-used-in-tests
+      NODE_ENV: test
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: npm
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Lint
+        run: npm run lint
+
+      - name: Build
+        run: npm run build
+
+      - name: Test
+        run: npm test
